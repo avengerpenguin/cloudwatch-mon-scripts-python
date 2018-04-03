@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import print_function
 from cloudwatchmon.cloud_watch_client import *
 
 import argparse
@@ -29,6 +30,7 @@ import random
 import re
 import sys
 import time
+import subprocess
 
 CLIENT_NAME = 'CloudWatch-PutInstanceData'
 FileCache.CLIENT_NAME = CLIENT_NAME
@@ -118,12 +120,13 @@ class LoadAverage:
 
 
 class Disk:
-    def __init__(self, mount, file_system, total, used, avail):
+    def __init__(self, mount, file_system, total, used, avail, inode_util):
         self.mount = mount
         self.file_system = file_system
         self.used = used
         self.avail = avail
         self.util = 100.0 * used / total if total > 0 else 0
+        self.inode_util = inode_util
 
 
 class Metrics:
@@ -167,7 +170,9 @@ class Metrics:
             self.names.append(name)
             self.units.append(unit)
             self.values.append(value)
-            self.dimensions.append(dict(common_dims.items() + dim.items()))
+            metric_dims = common_dims.copy()
+            metric_dims.update(dim)
+            self.dimensions.append(metric_dims)
 
     def send(self, verbose):
         boto_debug = 2 if verbose else 0
@@ -181,7 +186,7 @@ class Metrics:
 
         size = len(self.names)
 
-        for idx_start in xrange(0, size, AWS_LIMIT_METRICS_SIZE):
+        for idx_start in range(0, size, AWS_LIMIT_METRICS_SIZE):
             idx_end = idx_start + AWS_LIMIT_METRICS_SIZE
             response = conn.put_metric_data('System/Linux',
                                             self.names[idx_start:idx_end],
@@ -219,23 +224,20 @@ Supported UNITS are bytes, kilobytes, megabytes, and gigabytes.
 
 Examples
 
- To perform a simple test run without posting data to Amazon CloudWatch
+  To perform a simple test run without posting data to Amazon CloudWatch
 
-  ./put_instance_stats.py --mem-util --verify --verbose
-  or
-  # If installed via pip install cloudwatchmon
-  mon-put-instance-stats.py --mem-util --verify --verbose
+    mon-put-instance-stats.py --mem-util --verify --verbose
 
- To set a five-minute cron schedule to report memory and disk space utilization
- to CloudWatch
 
-  */5 * * * * ~/cloudwatchmon/put_instance_stats.py --mem-util --disk-space-util --disk-path=/ --from-cron
-  or
-  # If installed via pip install cloudwatchmon
-  * /5 * * * * /usr/local/bin/mon-put-instance-stats.py --mem-util --disk-space-util --disk-path=/ --from-cron
+  To set a five-minute cron schedule to report memory and disk space utilization
+  to CloudWatch
+
+    */5 * * * * mon-put-instance-stats.py --mem-util --disk-space-util --disk-path=/ --from-cron
+
 
   To report metrics from file
-  mon-put-instance-stats.py --from-file filename.csv
+
+    mon-put-instance-stats.py --from-file filename.csv
 
 For more information on how to use this utility, see project home on GitHub:
 https://github.com/osiegmar/cloudwatch-mon-scripts-python
@@ -280,7 +282,6 @@ https://github.com/osiegmar/cloudwatch-mon-scripts-python
                                action='store_true',
                                help='Report load averages for 1min, 5min and 15min divided by the number of CPU cores.')
 
-
     disk_group = parser.add_argument_group('disk metrics')
     disk_group.add_argument('--disk-path',
                             metavar='PATH',
@@ -301,6 +302,15 @@ https://github.com/osiegmar/cloudwatch-mon-scripts-python
                             type=to_lower,
                             choices=size_units,
                             help='Specifies units for disk space metrics.')
+    disk_group.add_argument('--disk-inode-util',
+                            action='store_true',
+                            help='Reports disk inode utilization in percentages.')
+
+    process_group = parser.add_argument_group('process metrics')
+    process_group.add_argument('--process-name',
+                               metavar='PROCNAME',
+                               action='append',
+                               help='Report CPU and Memory utilization metrics of processes.')
 
     exclusive_group = parser.add_mutually_exclusive_group()
     exclusive_group.add_argument('--from-cron',
@@ -351,6 +361,7 @@ def add_memory_metrics(args, metrics):
         metrics.add_metric('SwapUsed', mem_unit_name,
                            mem.swap_used() / mem_unit_div)
 
+
 def add_loadavg_metrics(args, metrics):
     loadavg = LoadAverage()
     if args.loadavg:
@@ -363,9 +374,10 @@ def add_loadavg_metrics(args, metrics):
         metrics.add_metric('LoadAvgPerCPU15Min', None, loadavg.loadavg_percpu_15min)
 
 
-def get_disk_info(paths):
+def get_disk_info(args):
+    paths = args.disk_path
     df_out = [s.split() for s in
-              os.popen('/bin/df -k -l -P ' +
+              os.popen('/bin/df -k -P ' +
                        ' '.join(paths)).read().splitlines()]
     disks = []
     for line in df_out[1:]:
@@ -374,14 +386,31 @@ def get_disk_info(paths):
         total = int(line[1]) * 1024
         used = int(line[2]) * 1024
         avail = int(line[3]) * 1024
-        disks.append(Disk(mount, file_system, total, used, avail))
+        disks.append(Disk(mount, file_system, total, used, avail, 0))
+
+    # Gather inode utilization if it is requested
+    if not args.disk_inode_util:
+        return disks
+
+    df_inode_out = [s.split() for s in
+                    os.popen('/bin/df -i -k -P ' +
+                             ' '.join(paths)).read().splitlines()]
+    disks_inode_util = []
+    for line in df_inode_out[1:]:
+        used = float(line[2])
+        total = float(line[1])
+        inode_util_val = 100.0 * used / total if total > 0 else 0
+        disks_inode_util.append(inode_util_val)
+
+    for index, disk in enumerate(disks):
+        disk.inode_util = disks_inode_util[index]
     return disks
 
 
 def add_disk_metrics(args, metrics):
     disk_unit_name = SIZE_UNITS_CFG[args.disk_space_units]['name']
     disk_unit_div = float(SIZE_UNITS_CFG[args.disk_space_units]['div'])
-    disks = get_disk_info(args.disk_path)
+    disks = get_disk_info(args)
     for disk in disks:
         if args.disk_space_util:
             metrics.add_metric('DiskSpaceUtilization', 'Percent',
@@ -394,6 +423,24 @@ def add_disk_metrics(args, metrics):
             metrics.add_metric('DiskSpaceAvailable', disk_unit_name,
                                disk.avail / disk_unit_div,
                                disk.mount, disk.file_system)
+        if args.disk_inode_util:
+            metrics.add_metric('InodeUtilization', 'Percent',
+                               disk.inode_util, disk.mount, disk.file_system)
+
+
+def add_process_metrics(args, metrics):
+    process_names = args.process_name
+    for process_name in process_names:
+        processes = subprocess.Popen(["ps", "axco", "command,pcpu,pmem"], stdout=subprocess.PIPE)
+        total_cpu = 0.0
+        total_mem = 0.0
+        for line in processes.stdout:
+            if re.search(process_name, line):
+                out = line.split()
+                total_cpu += float(out[1])
+                total_mem += float(out[2])
+        metrics.add_metric(process_name+'-CpuUtilization', 'Percent', total_cpu)
+        metrics.add_metric(process_name+'-MemoryUtilization', 'Percent', total_mem)
 
 
 def add_static_file_metrics(args, metrics):
@@ -403,7 +450,7 @@ def add_static_file_metrics(args, metrics):
                 (label, unit, value) = [x.strip() for x in line.split(',')]
                 metrics.add_metric(label, unit, value)
             except ValueError:
-                print 'Ignore unparseable metric: "' + line + '"'
+                print('Ignore unparseable metric: "' + line + '"')
                 pass
 
 
@@ -430,10 +477,11 @@ def validate_args(args):
         args.swap_util or args.swap_used
     report_disk_data = args.disk_path is not None
     report_loadavg_data = args.loadavg or args.loadavg_percpu
+    report_process_data = args.process_name is not None
 
     if report_disk_data:
         if not args.disk_space_util and not args.disk_space_used and \
-                not args.disk_space_avail:
+                not args.disk_space_avail and not args.disk_inode_util:
             raise ValueError('Disk path is provided but metrics to report '
                              'disk space are not specified.')
 
@@ -442,16 +490,16 @@ def validate_args(args):
                 raise ValueError('Disk file path ' + path +
                                  ' does not exist or cannot be accessed.')
     elif args.disk_space_util or args.disk_space_used or \
-            args.disk_space_avail:
+            args.disk_space_avail or args.disk_inode_util:
         raise ValueError('Metrics to report disk space are provided but '
                          'disk path is not specified.')
 
-    if not report_mem_data and not report_disk_data and not args.from_file and \
-            not report_loadavg_data:
+    if not report_mem_data and not report_disk_data and \
+            not args.from_file and not report_loadavg_data:
         raise ValueError('No metrics specified for collection and '
                          'submission to CloudWatch.')
 
-    return report_disk_data, report_mem_data, report_loadavg_data
+    return report_disk_data, report_mem_data, report_loadavg_data, report_process_data
 
 
 def main():
@@ -465,24 +513,25 @@ def main():
     args = parser.parse_args()
 
     if args.version:
-        print CLIENT_NAME + ' version ' + VERSION
+        print(CLIENT_NAME + ' version ' + VERSION)
         return 0
 
     try:
-        report_disk_data, report_mem_data, report_loadavg_data = validate_args(args)
+        report_disk_data, report_mem_data, report_loadavg_data, report_process_data = \
+            validate_args(args)
 
         # avoid a storm of calls at the beginning of a minute
         if args.from_cron:
             time.sleep(random.randint(0, 19))
 
         if args.verbose:
-            print 'Working in verbose mode'
-            print 'Boto-Version: ' + boto.__version__
+            print('Working in verbose mode')
+            print('Boto-Version: ' + boto.__version__)
 
         metadata = get_metadata()
 
         if args.verbose:
-            print 'Instance metadata: ' + str(metadata)
+            print('Instance metadata: ' + str(metadata))
 
         region = metadata['placement']['availability-zone'][:-1]
         instance_id = metadata['instance-id']
@@ -493,7 +542,7 @@ def main():
                                                                 args.verbose)
 
             if args.verbose:
-                print 'Autoscaling group: ' + autoscaling_group_name
+                print('Autoscaling group: ' + autoscaling_group_name)
 
         metrics = Metrics(region,
                           instance_id,
@@ -514,17 +563,20 @@ def main():
         if report_disk_data:
             add_disk_metrics(args, metrics)
 
+        if report_process_data:
+            add_process_metrics(args, metrics)
+
         if args.verbose:
-            print 'Request:\n' + str(metrics)
+            print('Request:\n' + str(metrics))
 
         if args.verify:
             if not args.from_cron:
-                print 'Verification completed successfully. ' \
-                      'No actual metrics sent to CloudWatch.'
+                print('Verification completed successfully. '
+                      'No actual metrics sent to CloudWatch.')
         else:
             metrics.send(args.verbose)
             if not args.from_cron:
-                print 'Successfully reported metrics to CloudWatch.'
+                print('Successfully reported metrics to CloudWatch.')
     except Exception as e:
         log_error(str(e), args.from_cron)
         return 1
