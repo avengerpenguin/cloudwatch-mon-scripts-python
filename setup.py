@@ -15,7 +15,7 @@ def readme():
 requires = ['boto>=2.33.0',]
 
 
- if sys.version_info == (2, 6):
+ if sys.version_info[:2] == (2, 6):
      requires += ['argparse']
 
 
